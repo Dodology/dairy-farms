@@ -2,7 +2,7 @@ DAIRY FARMS
 
 A bilingual (English / Arabic) web app for recording livestock milk production. Farmers and researchers can register animals with their pedigree, log weekly milk yields, and automatically compare lactation curves across seasons, parents and breeds.
 
-Live app: YOUR-APP-LINK
+Live app: https://dairy-farms-ceefhc5ynrmh9ceck2smsz.streamlit.app/
 
 
 FEATURES
