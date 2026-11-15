@@ -1,49 +1,84 @@
 import streamlit as st
-import sqlite3, hashlib, hmac, os, re, smtplib, secrets
+import psycopg2
+import hashlib, hmac, os, re, smtplib, secrets
 import pandas as pd
 from datetime import date
 from email.message import EmailMessage
 
 st.set_page_config(page_title="Dairy Farms", page_icon="🐄", layout="wide",
                    initial_sidebar_state="collapsed")
-DB = "dairy_farms.db"
 
 
-# ---------- DATABASE ----------
-def db():
-    c = sqlite3.connect(DB)
-    c.execute("PRAGMA foreign_keys = ON")
-    return c
+# ---------- DATABASE (Supabase / PostgreSQL) ----------
+def conn():
+    return psycopg2.connect(st.secrets["db"]["url"])
 
 
+def run(sql, params=None, fetch=None):
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute(sql, params)
+        out = None
+        if fetch == "one":
+            out = cur.fetchone()
+        elif fetch == "all":
+            out = cur.fetchall()
+        c.commit()
+        return out
+    finally:
+        c.close()
+
+
+def df_q(sql, params=None):
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        return pd.DataFrame(cur.fetchall(), columns=cols)
+    finally:
+        c.close()
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(
+    user_id SERIAL PRIMARY KEY, full_name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+    country TEXT, phone TEXT, role TEXT);
+CREATE TABLE IF NOT EXISTS farms(
+    farm_id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(user_id),
+    farm_name TEXT NOT NULL, governorate TEXT, location TEXT);
+CREATE TABLE IF NOT EXISTS animals(
+    id SERIAL PRIMARY KEY, farm_id INTEGER NOT NULL REFERENCES farms(farm_id),
+    animal_type TEXT, tag TEXT NOT NULL, breed TEXT, birth_date TEXT,
+    sex TEXT, origin TEXT, mother_tag TEXT, mother_breed TEXT,
+    mother_milk DOUBLE PRECISION, father_tag TEXT, father_breed TEXT,
+    grandam_milk DOUBLE PRECISION, UNIQUE(farm_id, tag));
+CREATE TABLE IF NOT EXISTS milk(
+    id SERIAL PRIMARY KEY, animal_id INTEGER NOT NULL REFERENCES animals(id),
+    calving_date TEXT NOT NULL, record_date TEXT NOT NULL,
+    weekly_total DOUBLE PRECISION NOT NULL, feed TEXT, notes TEXT);
+"""
+
+
+@st.cache_resource
 def init_db():
-    c = db()
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS users(
-        user_id INTEGER PRIMARY KEY AUTOINCREMENT, full_name TEXT NOT NULL,
-        email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
-        country TEXT, phone TEXT, role TEXT);
-    CREATE TABLE IF NOT EXISTS farms(
-        farm_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
-        farm_name TEXT NOT NULL, governorate TEXT, location TEXT,
-        FOREIGN KEY(user_id) REFERENCES users(user_id));
-    CREATE TABLE IF NOT EXISTS animals(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, farm_id INTEGER NOT NULL,
-        animal_type TEXT, tag TEXT NOT NULL, breed TEXT, birth_date TEXT,
-        sex TEXT, origin TEXT, mother_tag TEXT, mother_breed TEXT,
-        mother_milk REAL, father_tag TEXT, father_breed TEXT, grandam_milk REAL,
-        UNIQUE(farm_id, tag), FOREIGN KEY(farm_id) REFERENCES farms(farm_id));
-    CREATE TABLE IF NOT EXISTS milk(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, animal_id INTEGER NOT NULL,
-        calving_date TEXT NOT NULL, record_date TEXT NOT NULL,
-        weekly_total REAL NOT NULL, feed TEXT, notes TEXT,
-        FOREIGN KEY(animal_id) REFERENCES animals(id));
-    """)
-    c.commit()
-    c.close()
+    run(SCHEMA)
+    for t in ("users", "farms", "animals", "milk"):
+        try:
+            run(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY")
+        except Exception:
+            pass
+    return True
 
 
-init_db()
+try:
+    init_db()
+except Exception as ex:
+    st.error("Database connection failed. Check Settings > Secrets (the [db] url).")
+    st.caption(str(ex)[:300])
+    st.stop()
 
 
 def hp(p):
@@ -151,11 +186,9 @@ def send_mail(to, pw):
 
 
 def login_user(uid):
-    c = db()
-    u = c.execute("SELECT user_id,full_name FROM users WHERE user_id=?", (uid,)).fetchone()
-    f = c.execute("SELECT farm_id,farm_name FROM farms WHERE user_id=? ORDER BY farm_id DESC",
-                  (uid,)).fetchone()
-    c.close()
+    u = run("SELECT user_id,full_name FROM users WHERE user_id=%s", (uid,), "one")
+    f = run("SELECT farm_id,farm_name FROM farms WHERE user_id=%s ORDER BY farm_id DESC LIMIT 1",
+            (uid,), "one")
     st.session_state.user = {"id": u[0], "name": u[1], "farm": f[1]}
     st.session_state.farm_id = f[0]
     st.session_state.stack = []
@@ -164,17 +197,19 @@ def login_user(uid):
 
 
 def register_user(name, em, pw, country, phone, role, farm, gov, loc):
-    c = db()
+    c = conn()
     try:
-        cur = c.execute(
-            "INSERT INTO users(full_name,email,password_hash,country,phone,role) VALUES(?,?,?,?,?,?)",
+        cur = c.cursor()
+        cur.execute(
+            "INSERT INTO users(full_name,email,password_hash,country,phone,role) "
+            "VALUES(%s,%s,%s,%s,%s,%s) RETURNING user_id",
             (name, em, hp(pw), country, phone, role))
-        uid = cur.lastrowid
-        c.execute("INSERT INTO farms(user_id,farm_name,governorate,location) VALUES(?,?,?,?)",
-                  (uid, farm, gov, loc))
+        uid = cur.fetchone()[0]
+        cur.execute("INSERT INTO farms(user_id,farm_name,governorate,location) VALUES(%s,%s,%s,%s)",
+                    (uid, farm, gov, loc))
         c.commit()
         return uid
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         c.rollback()
         return None
     finally:
@@ -196,10 +231,8 @@ if st.session_state.user is None:
             p = st.text_input(tr("Password", "كلمة المرور"), type="password")
             ok = st.form_submit_button(tr("Log In", "دخول"), use_container_width=True)
         if ok:
-            c = db()
-            r = c.execute("SELECT user_id,password_hash FROM users WHERE email=?",
-                          (e.strip().lower(),)).fetchone()
-            c.close()
+            r = run("SELECT user_id,password_hash FROM users WHERE email=%s",
+                    (e.strip().lower(),), "one")
             if r and vp(p, r[1]):
                 login_user(r[0])
             else:
@@ -258,19 +291,18 @@ if st.session_state.user is None:
             fe = st.text_input(tr("Your account email", "بريد حسابك"))
             go_f = st.form_submit_button(tr("Send new password", "ابعت كلمة مرور جديدة"))
         if go_f:
-            c = db()
-            r = c.execute("SELECT user_id FROM users WHERE email=?", (fe.strip().lower(),)).fetchone()
+            fe = fe.strip().lower()
+            r = run("SELECT user_id FROM users WHERE email=%s", (fe,), "one")
+            sent = True
             if r:
                 tmp = secrets.token_urlsafe(8)
-                if send_mail(fe.strip().lower(), tmp):
-                    c.execute("UPDATE users SET password_hash=? WHERE user_id=?", (hp(tmp), r[0]))
-                    c.commit()
+                if send_mail(fe, tmp):
+                    run("UPDATE users SET password_hash=%s WHERE user_id=%s", (hp(tmp), r[0]))
                 else:
-                    r = None
+                    sent = False
                     st.error(tr("Email service is not configured yet.",
                                 "خدمة الإيميل لسه مش متظبطة."))
-            c.close()
-            if r:
+            if sent:
                 st.success(tr("If the email exists, a new password was sent.",
                               "لو الإيميل موجود، اتبعتله كلمة مرور جديدة."))
     st.stop()
@@ -297,9 +329,7 @@ if page == "dashboard":
         st.success(tr(f"Account created! Your ID is DF-{u['id']:04d}",
                       f"تم إنشاء الحساب! رقمك DF-{u['id']:04d}"))
         st.session_state.new_id = None
-    c = db()
-    n = c.execute("SELECT COUNT(*) FROM animals WHERE farm_id=?", (FID,)).fetchone()[0]
-    c.close()
+    n = run("SELECT COUNT(*) FROM animals WHERE farm_id=%s", (FID,), "one")[0]
     st.metric(tr("Registered Animals", "الحيوانات المسجلة"), n)
     a, b = st.columns(2)
     if a.button(tr("🐄 Animals", "🐄 الحيوانات"), use_container_width=True):
@@ -349,26 +379,21 @@ elif page == "animal_form":
         if not tag.strip():
             st.error(tr("Animal ID is required.", "رقم الحيوان مطلوب."))
         else:
-            c = db()
             try:
-                c.execute("""INSERT INTO animals(farm_id,animal_type,tag,breed,birth_date,sex,origin,
+                run("""INSERT INTO animals(farm_id,animal_type,tag,breed,birth_date,sex,origin,
                     mother_tag,mother_breed,mother_milk,father_tag,father_breed,grandam_milk)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                          (FID, at, tag.strip(), breed, bd.isoformat(), sex, origin, mt.strip() or None,
-                           None if mb == UNK else mb, mm or None, ft.strip() or None,
-                           None if fb == UNK else fb, gm or None))
-                c.commit()
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (FID, at, tag.strip(), breed, bd.isoformat(), sex, origin, mt.strip() or None,
+                     None if mb == UNK else mb, mm or None, ft.strip() or None,
+                     None if fb == UNK else fb, gm or None))
                 st.success(tr("Animal saved!", "تم حفظ الحيوان!"))
-            except sqlite3.IntegrityError:
+            except psycopg2.IntegrityError:
                 st.error(tr("This ID already exists on your farm.", "الرقم ده موجود بالفعل في مزرعتك."))
-            finally:
-                c.close()
 
 # ---------- MILK RECORDS ----------
 elif page == "milk":
     st.title(tr("Weekly Milk Record", "تسجيل اللبن الأسبوعي"))
-    c = db()
-    an = pd.read_sql_query("SELECT id,tag,breed FROM animals WHERE farm_id=? ORDER BY tag", c, params=(FID,))
+    an = df_q("SELECT id,tag,breed FROM animals WHERE farm_id=%s ORDER BY tag", (FID,))
     if an.empty:
         st.info(tr("Register an animal first.", "سجل حيوان الأول."))
     else:
@@ -387,25 +412,23 @@ elif page == "milk":
                 st.error(tr("Enter milk > 0 and a record date after calving.",
                             "ادخل كمية أكبر من صفر وتاريخ بعد الولادة."))
             else:
-                c.execute("INSERT INTO milk(animal_id,calving_date,record_date,weekly_total,feed,notes) VALUES(?,?,?,?,?,?)",
-                          (sel, cd.isoformat(), rd.isoformat(), wt, feed, nt))
-                c.commit()
+                run("INSERT INTO milk(animal_id,calving_date,record_date,weekly_total,feed,notes) "
+                    "VALUES(%s,%s,%s,%s,%s,%s)",
+                    (int(sel), cd.isoformat(), rd.isoformat(), wt, feed, nt))
                 st.success(tr("Saved. Charts updated.", "تم الحفظ. الجرافات اتحدثت."))
         if st.button(tr("📈 View Charts", "📈 عرض الجرافات"), use_container_width=True):
-            c.close()
             go("charts")
-    c.close()
 
 # ---------- CHARTS ----------
 elif page == "charts":
     st.title(tr("Milk Production Charts", "جرافات إنتاج اللبن"))
-    c = db()
-    df = pd.read_sql_query("""SELECT m.*,a.tag,a.breed,a.mother_milk,a.grandam_milk FROM milk m
-        JOIN animals a ON a.id=m.animal_id WHERE a.farm_id=?""", c, params=(FID,))
-    c.close()
+    df = df_q("""SELECT m.calving_date, m.record_date, m.weekly_total,
+        a.tag, a.breed, a.mother_milk, a.grandam_milk FROM milk m
+        JOIN animals a ON a.id=m.animal_id WHERE a.farm_id=%s""", (FID,))
     if df.empty:
         st.info(tr("No milk records yet.", "مفيش سجلات لسه."))
     else:
+        df["weekly_total"] = df["weekly_total"].astype(float)
         df["week"] = (pd.to_datetime(df.record_date) - pd.to_datetime(df.calving_date)).dt.days // 7 + 1
         df["daily"] = df.weekly_total / 7
         tags = sorted(df.tag.unique())
@@ -418,7 +441,7 @@ elif page == "charts":
         for col, name in (("mother_milk", tr("Mother", "الأم")), ("grandam_milk", tr("Father's mother", "أم الأب"))):
             v = d[col].dropna()
             if not v.empty:
-                pv[name] = v.iloc[0]
+                pv[name] = float(v.iloc[0])
         st.line_chart(pv)
         st.subheader(tr("Monthly total (L)", "الإنتاج الشهري (لتر)"))
         mo = d.assign(m=pd.to_datetime(d.record_date).dt.to_period("M").astype(str)).groupby("m").weekly_total.sum()
