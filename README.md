@@ -27,21 +27,6 @@ TECH STACK
 Python, Streamlit, pandas, Supabase (PostgreSQL), hosted on Streamlit Community Cloud.
 
 
-RUN LOCALLY
-
-1. Install the requirements:
-
-    pip install -r requirements.txt
-
-2. Create a Supabase project and add its Session pooler connection string to .streamlit/secrets.toml under a [db] section as url = "your connection string".
-
-3. Start the app:
-
-    streamlit run app.py
-
-Tables are created automatically on first run. Never commit secrets.toml to GitHub.
-
-
 ROADMAP
 
 Automatic pedigree tree, genetic analysis of the collected data, data export, and a quiz module.
